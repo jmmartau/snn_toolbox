@@ -19,7 +19,6 @@ from __future__ import print_function, unicode_literals
 import json
 import os
 
-from configparser import NoOptionError
 import numpy as np
 from future import standard_library
 
@@ -27,7 +26,7 @@ standard_library.install_aliases()
 
 
 def get_dataset(config):
-    """Get dataset, either from ``.npz`` files or ``keras.ImageDataGenerator``.
+    """Get data set, either from ``.npz`` files or ``keras.ImageDataGenerator``.
 
     Returns Dictionaries with keys ``x_test`` and ``y_test`` if data set was
     loaded in ``.npz`` format, or with ``dataflow`` key if data will be loaded
@@ -59,40 +58,23 @@ def get_dataset(config):
     is_normset_needed = config.getboolean('tools', 'normalize') and \
         normset is None
 
-    # _______________________________ Keras __________________________________#
-    try:
-        keras_dataset = config.get('input', 'keras_dataset')
-        if keras_dataset:
-            from keras_rewiring.utilities.load_dataset \
-                import load_and_preprocess_dataset
-            num_to_test = config.getint('simulation', 'num_to_test')
-            data = load_and_preprocess_dataset(keras_dataset)
-            x_test, y_test = data['test']
-            testset = {
-                'x_test': x_test[:num_to_test],
-                'y_test': y_test[:num_to_test]}
-            if is_normset_needed:
-                normset = {'x_norm': x_test}
-            return normset, testset
-    except (NoOptionError, ImportError) as e:
-        print("Warning:", e)
-
-    # ________________________________ npz ___________________________________#
+    # ________________________________ npz ____________________________________#
     if config.get('input', 'dataset_format') == 'npz':
         print("Loading data set from '.npz' files in {}.\n".format(
             dataset_path))
         if is_testset_needed:
             num_to_test = config.getint('simulation', 'num_to_test')
+            x_test_mh = load_npz(dataset_path, 'x_test.npz')
             testset = {
-                'x_test': load_npz(dataset_path, 'x_test.npz')[:num_to_test],
+                'x_test': [x_test_mh[i][:num_to_test,:,:] for i in range(len(x_test_mh))],
                 'y_test': load_npz(dataset_path, 'y_test.npz')[:num_to_test]}
             assert testset, "Test set empty."
         if is_normset_needed:
             normset = {'x_norm': load_npz(dataset_path, 'x_norm.npz')}
             assert normset, "Normalization set empty."
 
-    # ________________________________ jpg ___________________________________#
-    elif config.get('input', 'dataset_format') in {'jpg', 'png'}:
+    # ________________________________ jpg ____________________________________#
+    elif config.get('input', 'dataset_format') == 'jpg':
         from keras.preprocessing.image import ImageDataGenerator
         print("Loading data set from ImageDataGenerator, using images in "
               "{}.\n".format(dataset_path))
@@ -138,7 +120,7 @@ def get_dataset(config):
                 'dataflow': datagen.flow_from_directory(**dataflow_kwargs)}
             assert testset, "Test set empty."
 
-    # _______________________________ aedat __________________________________#
+    # _______________________________ aedat ___________________________________#
     elif config.get('input', 'dataset_format') == 'aedat':
         if is_normset_needed:
             normset = {'x_norm': load_npz(dataset_path, 'x_norm.npz')}
@@ -173,8 +155,8 @@ def try_get_normset_from_scalefacs(config):
     if not os.path.exists(newpath):
         os.makedirs(newpath)
         return
-    filepath = os.path.join(newpath, config.get('normalization',
-                                                'percentile') + '.json')
+    filepath = os.path.join(newpath, config.get('normalization', 'percentile') +
+                            '.json')
     if os.path.isfile(filepath):
         print("Loading scale factors from disk instead of recalculating.")
         with open(filepath) as f:

@@ -74,7 +74,11 @@ def normalize_parameters(model, config, **kwargs):
         size_str = ['{:.2f}'.format(s) for s in sizes]
         print("INFO: Need {} GB for layer activations.\n".format(size_str) +
               "May have to reduce size of data set used for normalization.")
-        scale_facs = OrderedDict({model.layers[0].name: 1})
+        scale_facs = OrderedDict()        
+        for layer in model.layers: 
+            if layer.__class__.__name__ == 'InputLayer':        
+                scale_facs[layer.name] = 1
+
     else:
         import warnings
         warnings.warn("Scale factors or normalization data set could not be "
@@ -82,15 +86,28 @@ def normalize_parameters(model, config, **kwargs):
                       RuntimeWarning)
         return
 
+    #print('kwargs:')
+    #print(kwargs[str('scale_facs')])
+
+    print('Model Layers:')
+    print(model.layers)
+    print('Model Layers 0:')
+    print(model.layers[0]) 
+
     batch_size = config.getint('simulation', 'batch_size')
 
     # If scale factors have not been computed in a previous run, do so now.
-    if len(scale_facs) == 1:
+    n_inputs = 0    
+    for layer in model.layers: 
+        if layer.__class__.__name__ == 'InputLayer':        
+            n_inputs += 1           
+
+    if len(scale_facs) == n_inputs:
         i = 0
         sparsity = []
         for layer in model.layers:
             # Skip if layer has no parameters
-            if len(layer.weights) == 0:
+            if (len(layer.weights) == 0) and (layer.name != 'InputLayer'):
                 continue
 
             activations = try_reload_activations(layer, model, x_norm,
@@ -100,7 +117,6 @@ def normalize_parameters(model, config, **kwargs):
             del activations
             perc = get_percentile(config, i)
             scale_facs[layer.name] = get_scale_fac(nonzero_activations, perc)
-            print("Scale factor: {:.2f}.".format(scale_facs[layer.name]))
             # Since we have calculated output activations here, check at this
             # point if the output is mostly negative, in which case we should
             # stick to softmax. Otherwise ReLU is preferred.
@@ -112,8 +128,8 @@ def normalize_parameters(model, config, **kwargs):
             #     if np.median(softmax_inputs) < 0:
             #         print("WARNING: You allowed the toolbox to replace "
             #               "softmax by ReLU activations. However, more than "
-            #               "half of the activations are negative, which "
-            #               "could reduce accuracy. Consider setting "
+            #               "half of the activations are negative, which could "
+            #               "reduce accuracy. Consider setting "
             #               "settings['softmax_to_relu'] = False.")
             #         settings['softmax_to_relu'] = False
             i += 1
@@ -130,7 +146,7 @@ def normalize_parameters(model, config, **kwargs):
     # Apply scale factors to normalize the parameters.
     for layer in model.layers:
         # Skip if layer has no parameters
-        if len(layer.weights) == 0:
+        if (len(layer.weights) == 0):# and (layer.name != 'InputLayer'):
             continue
 
         # Scale parameters
@@ -147,39 +163,37 @@ def normalize_parameters(model, config, **kwargs):
         else:
             scale_fac = scale_facs[layer.name]
         inbound = get_inbound_layers_with_params(layer)
+
+        print('Scale factors:')
+        print(scale_facs)
+        print('Current scale factor:')
+        print(scale_fac)       
+
         if len(inbound) == 0:  # Input layer
+            # noinspection PyProtectedMember
+            input_layer = layer._inbound_nodes[0].inbound_layers[0].name
             parameters_norm = [
-                parameters[0] * scale_facs[model.layers[0].name] / scale_fac,
+                parameters[0] * scale_facs[input_layer] / scale_fac,
                 parameters[1] / scale_fac]
         elif len(inbound) == 1:
             parameters_norm = [
                 parameters[0] * scale_facs[inbound[0].name] / scale_fac,
                 parameters[1] / scale_fac]
         else:
-            # In case of this layer receiving input from several layers, we can
-            # apply scale factor to bias as usual, but need to rescale weights
-            # according to their respective input.
-            parameters_norm = [parameters[0], parameters[1] / scale_fac]
-            if parameters[0].ndim == 4:
-                # In conv layers, just need to split up along channel dim.
-                offset = 0  # Index offset at input filter dimension
-                for inb in inbound:
-                    f_out = inb.filters  # Num output features of inbound layer
-                    f_in = range(offset, offset + f_out)
+            parameters_norm = [parameters[0]]  # Consider only weights at first
+            offset = 0  # Index offset at input filter dimension
+            for inb in inbound:
+                f_out = inb.filters  # Num output features of inbound layer
+                f_in = range(offset, offset + f_out)
+                if parameters[0].ndim == 2:  # Fully-connected Layer
+                    parameters_norm[0][f_in, :] *= \
+                        scale_facs[inb.name] / scale_fac
+                else:
                     parameters_norm[0][:, :, f_in, :] *= \
                         scale_facs[inb.name] / scale_fac
-                    offset += f_out
-            else:
-                # Fully-connected layers need more consideration, because they
-                # could receive input from several conv layers that are
-                # concatenated and then flattened. The neuron position in the
-                # flattened layer depend on the image_data_format.
-                raise NotImplementedError
+                offset += f_out
+            parameters_norm.append(parameters[1] / scale_fac)  # Append bias
 
-        # Check if the layer happens to be Sparse
-        # if the layer is sparse, add the mask to the list of parameters
-        if len(parameters) == 3:
-            parameters_norm.append(parameters[-1])
         # Update model with modified parameters
         layer.set_weights(parameters_norm)
 
@@ -198,9 +212,8 @@ def normalize_parameters(model, config, **kwargs):
             if len(layer.weights) == 0:
                 continue
 
-            label = str(idx) + layer.__class__.__name__ \
-                if config.getboolean('output', 'use_simple_labels') \
-                else layer.name
+            label = str(idx) + layer.__class__.__name__ if \
+                config.getboolean('output', 'use_simple_labels') else layer.name
             parameters = weights[layer.name]
             parameters_norm = layer.get_weights()[0]
             weight_dict = {'weights': parameters.flatten(),
@@ -222,8 +235,7 @@ def normalize_parameters(model, config, **kwargs):
                                'Activations_norm':
                                activations_norm[np.nonzero(activations_norm)]}
             scale_fac = scale_facs[layer.name]
-            plot_hist(activation_dict, 'Activation', label, norm_dir,
-                      scale_fac)
+            plot_hist(activation_dict, 'Activation', label, norm_dir, scale_fac)
             ax = tuple(np.arange(len(layer.output_shape))[1:])
             plot_max_activ_hist(
                 {'Activations_max': np.max(activations, axis=ax)},
@@ -252,10 +264,13 @@ def get_scale_fac(activations, percentile):
         Parameters of the respective layer are scaled by this value.
     """
 
-    return np.percentile(activations, percentile) if activations.size else 1
+    scale_fac = np.percentile(activations, percentile)
+    print("Scale factor: {:.2f}.".format(scale_fac))
+
+    return scale_fac
 
 
-def get_percentile(config, layer_idx=None):
+def get_percentile(config, layer_idx):
     """Get percentile at which to draw the maximum activation of a layer.
 
     Parameters
@@ -264,7 +279,7 @@ def get_percentile(config, layer_idx=None):
     config: configparser.ConfigParser
         Settings.
 
-    layer_idx: Optional[int]
+    layer_idx: int
         Layer index.
 
     Returns
@@ -278,7 +293,6 @@ def get_percentile(config, layer_idx=None):
     perc = config.getfloat('normalization', 'percentile')
 
     if config.getboolean('normalization', 'normalization_schedule'):
-        assert layer_idx, "Layer index needed for normalization schedule."
         perc = apply_normalization_schedule(perc, layer_idx)
 
     return perc
@@ -342,8 +356,8 @@ def get_activations_layer(layer_in, layer_out, x, batch_size=None):
     if batch_size is None:
         batch_size = 10
 
-    if len(x) % batch_size != 0:
-        x = x[: -(len(x) % batch_size)]
+    if len(x[0]) % batch_size != 0:
+        x = [x[i][:-(len(x[i]) % batch_size),:,:] for i in range(len(x))]
 
     return keras.models.Model(layer_in, layer_out).predict(x, batch_size)
 
@@ -378,14 +392,11 @@ def get_activations_batch(ann, x_batch):
 
     activations_batch = []
     for layer in ann.layers:
-        # Todo: This list should be replaced by
-        #       ``not in eval(config.get('restrictions', 'spiking_layers')``
-        if layer.__class__.__name__ in ['Input', 'InputLayer', 'Flatten',
-                                        'Concatenate', 'ZeroPadding2D',
-                                        'Reshape']:
+        if layer.__class__.__name__ in ['Input', 'InputLayer', 'Flatten', 'Lambda',
+                                        'Concatenate']:
             continue
-        activations = keras.models.Model(
-            ann.input, layer.output).predict_on_batch(x_batch)
+        activations = keras.models.Model(ann.input,
+                                         layer.output).predict_on_batch(x_batch)
         activations_batch.append((activations, layer.name))
     return activations_batch
 
@@ -405,4 +416,4 @@ def try_reload_activations(layer, model, x_norm, batch_size, activ_dir):
         np.savez_compressed(os.path.join(activ_dir, layer.name), activations)
     else:
         print("Loading activations stored during a previous run.")
-    return np.array(activations)
+    return activations
